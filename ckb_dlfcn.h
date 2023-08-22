@@ -80,6 +80,7 @@ typedef struct {
   uint64_t st_size;
 } Elf64_Sym;
 
+#define R_RISCV_64 2
 #define R_RISCV_RELATIVE 3
 #define R_RISCV_JUMP_SLOT 5
 
@@ -259,7 +260,8 @@ int ckb_dlopen2(const uint8_t *dep_cell_hash, uint8_t hash_type,
         if (ph->p_offset < prepad) {
           return ERROR_ELF_NOT_ALIGNED;
         }
-        ret = _ckb_load_cell_code(addr2, memsz, ph->p_offset - prepad, ph->p_filesz,
+
+        ret = _ckb_load_cell_code(addr2, memsz, ph->p_offset - prepad, ph->p_filesz + prepad,
                                   index, CKB_SOURCE_CELL_DEP);
         if (ret != CKB_SUCCESS) {
           return ret;
@@ -348,47 +350,12 @@ int ckb_dlopen2(const uint8_t *dep_cell_hash, uint8_t hash_type,
   if (shrtab_len < shshrtab->sh_size) {
     return ERROR_INVALID_ELF;
   }
+  /*
+   * We will deduce dynsym first, since some relocations might need this.
+   */
   for (int i = 0; i < header.e_shnum; i++) {
     const Elf64_Shdr *sh = &section_headers[i];
-    if (sh->sh_type == SHT_RELA) {
-      if (sh->sh_entsize != sizeof(Elf64_Rela)) {
-        return ERROR_INVALID_ELF;
-      }
-      size_t relocation_size = sh->sh_size / sh->sh_entsize;
-      uint64_t current_offset = sh->sh_offset;
-      while (relocation_size > 0) {
-        Elf64_Rela relocations[64];
-        size_t load_size = MIN(relocation_size, 64);
-        uint64_t load_length = load_size * sizeof(Elf64_Rela);
-        ret = ckb_load_cell_data((void *)relocations, &load_length,
-                                 current_offset, index, CKB_SOURCE_CELL_DEP);
-        if (ret != CKB_SUCCESS) {
-          return ret;
-        }
-        if (load_length < load_size * sizeof(Elf64_Rela)) {
-          return ERROR_INVALID_ELF;
-        }
-        relocation_size -= load_size;
-        current_offset += load_size * sizeof(Elf64_Rela);
-        for (size_t j = 0; j < load_size; j++) {
-          Elf64_Rela *r = &relocations[j];
-          uint32_t t = (uint32_t) r->r_info;
-          if (t != R_RISCV_RELATIVE && t != R_RISCV_JUMP_SLOT) {
-            /*
-             * Only relative and jump slot relocations are supported now,
-             * we might add more later.
-             */
-            return ERROR_INVALID_ELF;
-          }
-          if (r->r_offset >= (aligned_size - sizeof(uint64_t)) ||
-              r->r_addend >= (int64_t)(aligned_size) || r->r_addend < 0) {
-            return ERROR_INVALID_ELF;
-          }
-          uint64_t temp = (uint64_t)(aligned_addr + r->r_addend);
-          memcpy(aligned_addr + r->r_offset, &temp, sizeof(uint64_t));
-        }
-      }
-    } else if (sh->sh_type == SHT_DYNSYM) {
+    if (sh->sh_type == SHT_DYNSYM) {
       /* We assume one ELF file only has one DYNSYM section now */
       if (sh->sh_entsize != sizeof(Elf64_Sym)) {
         return ERROR_INVALID_ELF;
@@ -424,6 +391,59 @@ int ckb_dlopen2(const uint8_t *dep_cell_hash, uint8_t hash_type,
   }
   if (context->dynsyms == NULL || context->dynstr == NULL) {
     return ERROR_INVALID_ELF;
+  }
+  /*
+   * Now we will deal with relocations
+   */
+  for (int i = 0; i < header.e_shnum; i++) {
+    const Elf64_Shdr *sh = &section_headers[i];
+    if (sh->sh_type == SHT_RELA) {
+      if (sh->sh_entsize != sizeof(Elf64_Rela)) {
+        return ERROR_INVALID_ELF;
+      }
+      size_t relocation_size = sh->sh_size / sh->sh_entsize;
+      uint64_t current_offset = sh->sh_offset;
+      while (relocation_size > 0) {
+        Elf64_Rela relocations[64];
+        size_t load_size = MIN(relocation_size, 64);
+        uint64_t load_length = load_size * sizeof(Elf64_Rela);
+        ret = ckb_load_cell_data((void *)relocations, &load_length,
+                                 current_offset, index, CKB_SOURCE_CELL_DEP);
+        if (ret != CKB_SUCCESS) {
+          return ret;
+        }
+        if (load_length < load_size * sizeof(Elf64_Rela)) {
+          return ERROR_INVALID_ELF;
+        }
+        relocation_size -= load_size;
+        current_offset += load_size * sizeof(Elf64_Rela);
+        for (size_t j = 0; j < load_size; j++) {
+          Elf64_Rela *r = &relocations[j];
+          uint32_t t = (uint32_t) r->r_info;
+          switch (t) {
+            case R_RISCV_RELATIVE:
+            case R_RISCV_JUMP_SLOT: {
+              if (r->r_offset >= (aligned_size - sizeof(uint64_t)) ||
+                  r->r_addend >= (int64_t)(aligned_size) || r->r_addend < 0) {
+                return ERROR_INVALID_ELF;
+              }
+              uint64_t temp = (uint64_t)(aligned_addr + r->r_addend);
+              memcpy(aligned_addr + r->r_offset, &temp, sizeof(uint64_t));
+            } break;
+            case R_RISCV_64: {
+              uint32_t index = (uint32_t) (r->r_info >> 32);
+              if (index >= context->dynsym_size) {
+                return ERROR_INVALID_ELF;
+              }
+              uint64_t temp = context->dynsyms[index].st_value + r->r_addend;
+              memcpy(aligned_addr + r->r_offset, &temp, sizeof(uint64_t));
+            } break;
+            default:
+              return ERROR_INVALID_ELF;
+          }
+        }
+      }
+    }
   }
   *handle = (void *)context;
   *consumed_size = max_consumed_size + RISCV_PGSIZE;
