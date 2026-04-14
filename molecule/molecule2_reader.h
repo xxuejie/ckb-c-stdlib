@@ -92,12 +92,17 @@ typedef int8_t Int8;      // [byte; 1]
     (a) = (b);        \
     (b) = (t);        \
   }
+
+#ifdef CKB
+#define is_le2() 1
+#else
 #define is_le2()      \
   ((union {           \
      uint16_t i;      \
      unsigned char c; \
    }){.i = 1}         \
        .c)
+#endif
 
 void change_endian(uint8_t *ptr, int size);
 /**
@@ -579,12 +584,14 @@ mol2_cursor_t mol2_make_cursor_from_memory(const void *memory, uint32_t size) {
   cur.offset = 0;
   cur.size = size;
   // init data source
-  static mol2_data_source_t s_data_source = {0};
+  static mol2_data_source_t s_data_source;
 
   s_data_source.read = mol2_source_memory;
   s_data_source.total_size = size;
   s_data_source.args[0] = (uintptr_t)memory;
   s_data_source.args[1] = (uintptr_t)size;
+  s_data_source.args[2] = 0;
+  s_data_source.args[3] = 0;
 
   s_data_source.cache_size = 0;
   s_data_source.start_point = 0;
